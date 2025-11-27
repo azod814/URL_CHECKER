@@ -1,46 +1,26 @@
+cat > url_checker.py <<'PY'
+#!/usr/bin/env python3
 import requests
 import sys
 import re
 from termcolor import colored
 import pyfiglet
 import time
+import os
 
-# API Keys (Replace with your own)
-GOOGLE_SAFE_BROWSING_API_KEY = "YOUR_GOOGLE_SAFE_BROWSING_API_KEY"
+# Use environment variable first, else fall back to placeholder
+GOOGLE_SAFE_BROWSING_API_KEY = os.getenv("GOOGLE_SAFE_BROWSING_API_KEY", "YOUR_GOOGLE_SAFE_BROWSING_API_KEY")
 
 def print_banner():
-    banner = r"""
-                                          _____                    _____                    _____
-                                         /\    \                  /\    \                  /\    \
-                                        /::\____\                /::\    \                /::\____\
-                                       /:::/    /               /::::\    \              /:::/    /
-                                      /:::/    /               /::::::\    \            /:::/    /
-                                     /:::/    /               /:::/\:::\    \          /:::/    /
-                                    /:::/    /               /:::/__\:::\    \        /:::/    /
-                                   /:::/    /               /::::\   \:::\    \      /:::/    /
-                                  /:::/    /      _____    /::::::\   \:::\    \    /:::/    /
-                                 /:::/____/      /\    \  /:::/\:::\   \:::\____\  /:::/    /
-                                |:::|    /      /::\____\/:::/  \:::\   \:::|    |/:::/____/
-                                |:::|____\     /:::/    /\::/   |::::\  /:::|____|\:::\    \
-                                 \:::\    \   /:::/    /  \/____|:::::\/:::/    /  \:::\    \
-                                  \:::\    \ /:::/    /         |:::::::::/    /    \:::\    \
-                                   \:::\    /:::/    /          |::|\::::/    /      \:::\    \
-                                    \:::\__/:::/    /           |::| \::/____/        \:::\    \
-                                     \::::::::/    /            |::|  ~|               \:::\    \
-                                      \::::::/    /             |::|   |                \:::\    \
-                                       \::::/    /              \::|   |                 \:::\____\
-                                        \::/____/                \:|   |                  \::/    /
-                                         ~~                       \|___|                   \/____/
-"""
+    banner = pyfiglet.figlet_format("URL / Email Checker", font="standard")
     print(colored(banner, "cyan"))
 
 def check_url_safety(url):
+    if GOOGLE_SAFE_BROWSING_API_KEY in (None, "", "YOUR_GOOGLE_SAFE_BROWSING_API_KEY"):
+        return {"error": "Missing Google Safe Browsing API key. Set env var GOOGLE_SAFE_BROWSING_API_KEY or edit the script."}
     api_url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_SAFE_BROWSING_API_KEY}"
     payload = {
-        "client": {
-            "clientId": "urlchecker",
-            "clientVersion": "1.0"
-        },
+        "client": {"clientId": "urlchecker", "clientVersion": "1.0"},
         "threatInfo": {
             "threatTypes": ["MALWARE", "SOCIAL_ENGINEERING", "UNWANTED_SOFTWARE"],
             "platformTypes": ["ANY_PLATFORM"],
@@ -49,64 +29,77 @@ def check_url_safety(url):
         }
     }
     try:
-        response = requests.post(api_url, json=payload)
-        return response.json()
-    except:
-        return {"error": "API request failed"}
-
-def check_email_safety(email):
-    domain = email.split("@")[-1]
-    url = f"http://{domain}"
-    return check_url_safety(url)
+        resp = requests.post(api_url, json=payload, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.exceptions.RequestException as e:
+        return {"error": f"API request failed: {e}"}
+    except ValueError:
+        return {"error": "Invalid response from API (not JSON)."}
 
 def print_loading():
-    for _ in range(3):
-        sys.stdout.write(colored("\r[*] Checking" + "." * (_ + 1), "yellow"))
+    for i in range(3):
+        sys.stdout.write(colored("\r[*] Checking" + "." * (i + 1), "yellow"))
         sys.stdout.flush()
-        time.sleep(0.5)
+        time.sleep(0.4)
     print()
 
-def main():
-    print_banner()
-
-    if len(sys.argv) != 2:
-        print(colored("\n[!] Usage: python url_email_checker.py <url/email>", "red"))
-        print(colored("    Example: python url_email_checker.py example.com", "yellow"))
-        print(colored("             python url_email_checker.py test@example.com", "yellow"))
-        sys.exit(1)
-
-    target = sys.argv[1]
+def handle_target(target):
     target_type = "email" if "@" in target else "url"
-
     print(colored(f"\n[*] Target: {target} ({target_type})", "yellow"))
     print_loading()
 
     if target_type == "url":
+        if not target.startswith(("http://", "https://")):
+            target = "http://" + target
         result = check_url_safety(target)
         if "error" in result:
-            print(colored("\n[!] Error: Could not check URL.", "red"))
+            print(colored(f"\n[!] Error: {result['error']}", "red"))
         elif "matches" in result and result["matches"]:
             print(colored("\n[!] ❌ UNSAFE URL!", "red"))
             for match in result["matches"]:
-                print(colored(f"    - Threat: {match['threatType']}", "red"))
+                print(colored(f"    - Threat: {match.get('threatType')}", "red"))
         else:
             print(colored("\n[✅] SAFE URL! No threats detected.", "green"))
 
-    elif target_type == "email":
+    else:  # email
         if not re.match(r"[^@]+@[^@]+\.[^@]+", target):
             print(colored("\n[!] Invalid email format.", "red"))
-            sys.exit(1)
-        result = check_email_safety(target)
+            return
+        domain = target.split("@")[-1]
+        result = check_url_safety("http://" + domain)
         if "error" in result:
-            print(colored("\n[!] Error: Could not check email domain.", "red"))
+            print(colored(f"\n[!] Error: {result['error']}", "red"))
         elif "matches" in result and result["matches"]:
             print(colored("\n[!] ❌ UNSAFE EMAIL DOMAIN!", "red"))
             for match in result["matches"]:
-                print(colored(f"    - Threat: {match['threatType']}", "red"))
+                print(colored(f"    - Threat: {match.get('threatType')}", "red"))
         else:
             print(colored("\n[✅] SAFE EMAIL DOMAIN! No threats detected.", "green"))
 
-    print()
+def main():
+    print_banner()
+
+    # If user passed an argument, handle it and exit gracefully (keeps output visible).
+    if len(sys.argv) == 2:
+        handle_target(sys.argv[1])
+        return
+
+    # Interactive loop (keeps terminal open)
+    print(colored("Interactive mode — type URL or email to check. Type 'exit' or Ctrl+C to quit.", "yellow"))
+    while True:
+        try:
+            target = input(colored("\nEnter URL or email> ", "cyan")).strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nBye.")
+            break
+        if not target:
+            continue
+        if target.lower() in ("exit", "quit"):
+            print("Exiting.")
+            break
+        handle_target(target)
 
 if __name__ == "__main__":
     main()
+PY
