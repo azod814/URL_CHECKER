@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-URL & Email Checker — GUI updated (green/pro look + emoji verdict banner)
-
-What changed visually:
- - Green professional-ish background and card panels
- - Colored action buttons (primary green) that work cross-platform
- - Big emoji + bold verdict banner (SAFE / SUSPICIOUS / XNOTSAFE) for clarity
- - Result details remain in a ScrolledText below the banner
- - Functionality (Safe Browsing + heuristics + email checks) preserved
+URL & Email Checker — Updated strict email & hostname validation + GUI (green/pro look)
+- Stricter email validation (rejects malformed addresses like 'user@!mail.com' or missing '@')
+- Hostname validation per-label rules
+- DNS resolution impact on scoring
+- GUI shows big emoji + bold verdicts (SAFE/SUSPICIOUS/XNOTSAFE/INVALID)
 """
 
 import os
@@ -17,7 +14,7 @@ import requests
 import urllib.parse
 import socket
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
 
 # Optional console banner libs — silent fallback
@@ -40,6 +37,7 @@ BIG_ASCII = r"""
     \|_______|\|__|\|__|\|_______|                                     
 """
 
+# Disposable and shortener lists
 DISPOSABLE_DOMAINS = {
     "mailinator.com", "10minutemail.com", "guerrillamail.com", "yopmail.com",
     "trashmail.com", "temp-mail.org", "dispostable.com", "maildrop.cc"
@@ -48,6 +46,8 @@ DISPOSABLE_DOMAINS = {
 URL_SHORTENERS = {
     "bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "buff.ly", "is.gd", "tiny.cc", "rb.gy"
 }
+
+# ---------- Utilities / Validation ----------
 
 def print_banner():
     try:
@@ -68,10 +68,70 @@ def normalize_url(user_input: str) -> str:
         return user_input.strip()
     return urllib.parse.urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path or "/", "", parsed.query or "", parsed.fragment or ""))
 
+def is_valid_hostname(hostname: str) -> bool:
+    """
+    Validate hostname labels:
+     - 1..63 chars per label, overall <=253
+     - labels only [A-Za-z0-9-], not start/end with hyphen
+     - allow punycode xn--
+    """
+    if not hostname:
+        return False
+    # remove port if present and userinfo if present
+    host = hostname.split(":")[0].split("@")[-1].strip().lower()
+    if len(host) > 253:
+        return False
+    # allow single-label (like localhost) but still validate characters
+    labels = host.split(".")
+    for label in labels:
+        if not label:
+            return False
+        if len(label) < 1 or len(label) > 63:
+            return False
+        if label.startswith("-") or label.endswith("-"):
+            return False
+        # allow punycode prefix 'xn--'
+        if label.startswith("xn--"):
+            # basic length check done above; accept punycode label
+            continue
+        if not re.match(r"^[A-Za-z0-9-]+$", label):
+            return False
+    return True
+
 def is_valid_email(email: str) -> bool:
-    return bool(re.match(r"^[A-Za-z0-9._%+\-']+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$", email.strip()))
+    """
+    Strict but pragmatic email syntax check:
+    - Must have single @
+    - Local part: letters, digits and allowed punctuation ._%+-' (no spaces or weird chars)
+    - Domain part validated by is_valid_hostname
+    """
+    e = email.strip()
+    # Quick basic pattern
+    if "@" not in e:
+        return False
+    parts = e.split("@")
+    if len(parts) != 2:
+        return False
+    local, domain = parts[0], parts[1]
+    if not local or not domain:
+        return False
+    # local part rules: allow these chars, but not start/end with dot, not consecutive dots
+    if local.startswith(".") or local.endswith(".") or ".." in local:
+        return False
+    if not re.match(r"^[A-Za-z0-9._%+\-']+$", local):
+        return False
+    # domain must be valid hostname (reject illegal chars like '!')
+    if not is_valid_hostname(domain):
+        return False
+    # domain must contain at least one dot (e.g., example.com). Accept 'localhost' only if explicitly wanted (we'll require dot)
+    if "." not in domain:
+        return False
+    return True
+
+# ---------- Networking / API ----------
 
 def check_url_safety_api(url: str, timeout=10):
+    """Google Safe Browsing call if API key present."""
     if not GOOGLE_SAFE_BROWSING_API_KEY:
         return {"error": "Missing Google Safe Browsing API key (env var GOOGLE_SAFE_BROWSING_API_KEY)."}
     api_url = f"https://safebrowsing.googleapis.com/v4/threatMatches:find?key={GOOGLE_SAFE_BROWSING_API_KEY}"
@@ -94,22 +154,39 @@ def check_url_safety_api(url: str, timeout=10):
         return {"error": "Invalid JSON response from API."}
 
 def quick_http_check(url: str, timeout=8):
+    """
+    HTTP check with clearer DNS vs network error classification.
+    Returns either {'status_code', 'final_url', 'ok'} or {'error':'dns'/'network', 'message':...}
+    """
     try:
         resp = requests.head(url, allow_redirects=True, timeout=timeout)
         return {"status_code": resp.status_code, "final_url": resp.url, "ok": resp.ok}
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as e_head:
+        msg = str(e_head)
+        # DNS error patterns (urllib3 / requests)
+        if "Name or service not known" in msg or "Failed to resolve" in msg or "NameResolutionError" in msg or "getaddrinfo failed" in msg:
+            return {"error": "dns", "message": msg}
+        # fallback to GET
         try:
             resp = requests.get(url, allow_redirects=True, timeout=timeout)
             return {"status_code": resp.status_code, "final_url": resp.url, "ok": resp.ok}
-        except requests.exceptions.RequestException as e:
-            return {"error": f"Network error: {e}"}
+        except requests.exceptions.RequestException as e_get:
+            msg2 = str(e_get)
+            if "Name or service not known" in msg2 or "Failed to resolve" in msg2 or "NameResolutionError" in msg2 or "getaddrinfo failed" in msg2:
+                return {"error": "dns", "message": msg2}
+            return {"error": "network", "message": msg2}
 
 def domain_resolves(domain: str) -> bool:
+    """Basic check: does domain resolve to A/AAAA?"""
     try:
-        socket.getaddrinfo(domain, None)
+        # remove port/userinfo
+        d = domain.split(":")[0].split("@")[-1]
+        socket.getaddrinfo(d, None)
         return True
     except Exception:
         return False
+
+# ---------- Heuristics & Classification ----------
 
 def hostname_of(url: str) -> str:
     try:
@@ -119,10 +196,18 @@ def hostname_of(url: str) -> str:
         return ""
 
 def classify_url(url: str):
+    """Classify URL with early invalid-hostname detection and DNS handling."""
     reasons = []
     url_norm = normalize_url(url)
     host = hostname_of(url_norm)
+
+    # Early hostname syntax validation
+    if not is_valid_hostname(host):
+        reasons.append("Invalid hostname syntax (illegal characters or invalid labels).")
+        return "phishing", reasons
+
     score = 0
+    # Google Safe Browsing
     if GOOGLE_SAFE_BROWSING_API_KEY:
         api = check_url_safety_api(url_norm)
         if api and "matches" in api and api["matches"]:
@@ -130,56 +215,51 @@ def classify_url(url: str):
             return "phishing", reasons
         if "error" in api:
             reasons.append(f"Safe Browsing API error: {api['error']}. Proceeding heuristics.")
+
+    # HTTP/DNS check
     http = quick_http_check(url_norm)
     if "error" in http:
-        reasons.append(f"Network/HTTP check failed: {http['error']}")
-        score += 1
+        if http["error"] == "dns":
+            reasons.append(f"DNS resolution failure: {http.get('message')}")
+            score += 3
+        else:
+            reasons.append(f"Network error: {http.get('message')}")
+            score += 1
     else:
         code = http.get("status_code")
         final = http.get("final_url")
         if code and 400 <= code < 600:
-            reasons.append(f"Server returned error status {code}.")
+            reasons.append(f"Server returned HTTP error status {code}.")
             score += 1
         if final:
             final_host = hostname_of(final)
             if final_host and final_host != host:
-                reasons.append(f"Redirects to different host ({final_host}) — could be phishing/redirector.")
+                reasons.append(f"Redirects to different host ({final_host}) — possible redirector.")
                 score += 2
+
+    # other heuristics
     if re.search(r"^\[?\d{1,3}(\.\d{1,3}){3}\]?$", host) or re.search(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}", host):
-        reasons.append("URL uses raw IP address instead of domain.")
+        reasons.append("Raw IP address used in URL.")
         score += 3
     if host.count(".") >= 4:
-        reasons.append("Long subdomain chain (common trick to hide real domain).")
+        reasons.append("Long subdomain chain (possible obfuscation).")
         score += 2
     if host.startswith("xn--") or "xn--" in host:
-        reasons.append("Contains punycode (xn--). Could be IDN homograph trick.")
+        reasons.append("Punycode (xn--) present — IDN homograph risk.")
         score += 3
     if re.search(r"[0-9].*", host) and not re.search(r"[a-zA-Z]", host.split(".")[0]):
-        reasons.append("Hostname contains many digits and few letters.")
+        reasons.append("Hostname heavy on digits, few letters.")
         score += 2
     if host.count("-") >= 2:
-        reasons.append("Hostname has multiple hyphens (a common phishing pattern).")
+        reasons.append("Multiple hyphens in hostname.")
         score += 1
-    suspicious_keywords = ["login", "signin", "secure", "verify", "update", "confirm", "banking", "account", "password", "pay", "checkout"]
     path = urllib.parse.urlparse(url_norm).path.lower()
+    suspicious_keywords = ["login", "signin", "secure", "verify", "update", "confirm", "banking", "account", "password", "pay", "checkout"]
     for kw in suspicious_keywords:
         if kw in path or kw in host:
-            reasons.append(f"Contains suspicious keyword '{kw}' in host/path.")
+            reasons.append(f"Contains suspicious keyword '{kw}'.")
             score += 1
-    naked_host = host.split(":")[0].split("@")[-1]
-    if naked_host in URL_SHORTENERS:
-        reasons.append("URL shortener used — could hide final destination.")
-        score += 2
-    query = urllib.parse.urlparse(url_norm).query
-    if query and len(query) > 120:
-        reasons.append("Very long query string (may include encoded malicious payloads).")
-        score += 1
-    suspicious_tlds = {".zip", ".review", ".country", ".kim", ".work", ".gdn", ".tk", ".ml"}
-    for tld in suspicious_tlds:
-        if host.endswith(tld):
-            reasons.append(f"TLD '{tld}' is often used by low-quality or phishing domains.")
-            score += 1
-            break
+
     if score >= 5:
         reasons.insert(0, f"Suspicion score {score} (higher is worse).")
         return "phishing", reasons
@@ -187,7 +267,7 @@ def classify_url(url: str):
         reasons.insert(0, f"Suspicion score {score}.")
         return "suspicious", reasons
     else:
-        reasons.insert(0, f"Suspicion score {score}. No strong heuristics flagged.")
+        reasons.insert(0, f"Suspicion score {score}.")
         return "safe", reasons
 
 def analyze_url(url: str):
@@ -207,38 +287,58 @@ def analyze_url(url: str):
         out.append(f" - {r}")
     http = quick_http_check(url_norm)
     if "error" in http:
-        out.append(f"\nHTTP check: {http['error']}")
+        out.append(f"\nHTTP check: {http.get('error')} - {http.get('message')}")
     else:
         out.append(f"\nHTTP status: {http.get('status_code')}  final URL: {http.get('final_url')}")
     return "\n".join(out)
 
+# ---------- Email classification ----------
+
 def classify_email(email: str):
+    """
+    Strictly classify email:
+     - invalid: syntax or illegal domain -> immediate invalid
+     - unsafe: disposable domain or clearly suspicious
+     - suspicious: domain doesn't resolve, long numeric local, generic local parts
+     - safe: passes checks
+    """
     e = email.strip()
     reasons = []
     if not is_valid_email(e):
-        return "invalid", ["Invalid email format."]
+        return "invalid", ["Invalid email format or illegal domain characters."]
     local, domain = e.split("@", 1)
     domain = domain.lower()
     score = 0
+
+    # disposable
     if domain in DISPOSABLE_DOMAINS:
         reasons.append("Domain is a known disposable email provider.")
         score += 3
+
+    # domain resolution
     if domain_resolves(domain):
-        reasons.append("Domain resolves (A/AAAA record found).")
+        reasons.append("Domain resolves (A/AAAA record present).")
     else:
-        reasons.append("Domain does NOT resolve — could be fake or typo.")
+        reasons.append("Domain does NOT resolve publicly.")
         score += 2
-    if re.search(r"(noreply|no-reply|admin|support|service|secure)", local, re.I):
-        reasons.append("Local-part uses generic/service terms (noreply/admin) — be careful with auto messages.")
+
+    # local-part heuristics
+    if re.search(r"(noreply|no-reply|admin|support|service|secure|postmaster)", local, re.I):
+        reasons.append("Local-part uses generic/service terms (noreply/admin).")
         score += 1
     if re.search(r"\d{5,}", local):
-        reasons.append("Local part has long sequence of digits (common in auto-generated/disposable addresses).")
+        reasons.append("Local-part contains long sequence of digits (often auto-generated/disposable).")
         score += 1
+    # odd characters already filtered in is_valid_email
+
+    # MX check: lightweight probe (try resolving MX via getaddrinfo on smtp port)
     try:
         socket.getaddrinfo(domain, 25)
-        reasons.append("Appears to accept SMTP connections (port probe possible).")
+        reasons.append("Appears to accept SMTP connections (basic reachability).")
     except Exception:
+        # no extra penalty here; domain_resolves already handles missing DNS
         pass
+
     if score >= 4:
         return "unsafe", reasons
     elif 2 <= score < 4:
@@ -252,7 +352,7 @@ def analyze_email(email: str):
     label, reasons = classify_email(email)
     out.append("")
     if label == "invalid":
-        out.append("❌ Invalid email format.")
+        out.append("❌ INVALID email format.")
     elif label == "unsafe":
         out.append("❌ XNOTSAFE / POSSIBLY FRAUDULENT (email).")
     elif label == "suspicious":
@@ -265,10 +365,9 @@ def analyze_email(email: str):
         out.append(f" - {r}")
     return "\n".join(out)
 
-# ---------- GUI Helpers (visuals) ----------
+# ---------- GUI (visuals) ----------
 
 def make_primary_btn(master, text, cmd):
-    # Use tk.Button for background color that works across platforms
     return tk.Button(master, text=text, command=cmd,
                      bg="#1E9A48", fg="white", activebackground="#14783a",
                      activeforeground="white", bd=0, padx=10, pady=6,
@@ -281,18 +380,16 @@ def make_secondary_btn(master, text, cmd):
                      font=("Segoe UI", 9, "bold"))
 
 def verdict_style(label_widget, verdict):
-    # verdict: 'safe','suspicious','phishing','invalid'
     if verdict == "safe":
         label_widget.config(text="✅ SAFE", fg="#074f1d", bg="#dff7e6")
     elif verdict == "suspicious":
         label_widget.config(text="⚠️ SUSPICIOUS", fg="#6a4a00", bg="#fff7e0")
-    elif verdict == "phishing":
+    elif verdict == "phishing" or verdict == "unsafe":
         label_widget.config(text="❌ XNOTSAFE", fg="#7a0a08", bg="#ffe6e6")
     elif verdict == "invalid":
         label_widget.config(text="❌ INVALID", fg="#7a0a08", bg="#ffe6e6")
     else:
         label_widget.config(text="ℹ️ RESULT", fg="black", bg="#f0f0f0")
-    # bold large font
     label_widget.config(font=("Segoe UI", 16, "bold"), padx=12, pady=8)
 
 class CheckerWindow:
@@ -306,7 +403,6 @@ class CheckerWindow:
         except Exception:
             pass
 
-        # Card-style main frame
         outer = tk.Frame(self.win, bg="#eaf6ee")
         outer.pack(expand=True, fill="both")
         frame = tk.Frame(outer, bg="white", bd=0, padx=14, pady=12, relief="flat")
@@ -323,11 +419,9 @@ class CheckerWindow:
         self.check_btn = make_primary_btn(input_row, "Check", self.start_check)
         self.check_btn.pack(side="right")
 
-        # Verdict banner
         self.verdict_lbl = tk.Label(frame, text=" ", bg="#f0f0f0", anchor="center")
         self.verdict_lbl.pack(fill="x", pady=(6, 6))
 
-        # Result area
         self.result_text = ScrolledText(frame, wrap="word", font=("Consolas", 11), state="disabled", height=14, bd=1, relief="solid")
         self.result_text.pack(expand=True, fill="both", pady=(4, 4))
 
@@ -371,12 +465,14 @@ class CheckerWindow:
 
     def _run_check(self, query):
         try:
-            if "@" in query and is_valid_email(query):
-                res = analyze_email(query)
-                label, _ = classify_email(query)
-            elif "@" in query and not is_valid_email(query):
-                res = "❌ Invalid email format."
-                label = "invalid"
+            if "@" in query:
+                # Always run strict email validation first if '@' present
+                if is_valid_email(query):
+                    res = analyze_email(query)
+                    label, _ = classify_email(query)
+                else:
+                    res = "❌ Invalid email format or illegal characters in domain."
+                    label = "invalid"
             else:
                 res = analyze_url(query)
                 label, _ = classify_url(query)
@@ -386,14 +482,13 @@ class CheckerWindow:
         self.win.after(0, self._finish_check, res, label)
 
     def _finish_check(self, res, label):
-        # Update verdict banner (map classify labels to visual label)
         if label == "safe":
             verdict_style(self.verdict_lbl, "safe")
         elif label == "suspicious":
             verdict_style(self.verdict_lbl, "suspicious")
-        elif label == "phishing":
+        elif label in ("phishing", "unsafe"):
             verdict_style(self.verdict_lbl, "phishing")
-        elif label == "invalid" or label == "unsafe":
+        elif label == "invalid":
             verdict_style(self.verdict_lbl, "invalid")
         else:
             verdict_style(self.verdict_lbl, None)
@@ -414,10 +509,8 @@ class MainApp:
             root.attributes("-alpha", 0.99)
         except Exception:
             pass
-        # background
         root.configure(bg="#eaf6ee")
 
-        # top card
         top_card = tk.Frame(root, bg="white", bd=0, padx=12, pady=10)
         top_card.place(relx=0.03, rely=0.04, relwidth=0.94, relheight=0.92)
 
@@ -477,11 +570,6 @@ class MainApp:
 def main():
     print_banner()
     root = tk.Tk()
-    try:
-        style = ttk.Style(root)
-        style.theme_use("clam")
-    except Exception:
-        pass
     app = MainApp(root)
     root.mainloop()
 
